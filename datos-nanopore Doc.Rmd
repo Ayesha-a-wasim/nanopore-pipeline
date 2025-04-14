@@ -1,0 +1,229 @@
+---
+title: "datos_nanopore doc"
+author: "Ayesha"
+date: "2025-01-21"
+output: html_document
+---
+#Basecalling: 
+(if needed) used to convert raw FAST5 into FastQ files
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#LongQC / MiniOnQC
+(if needed )These are used to process raw raw FAST5 files produced by Oxford Nanopore sequencing
+
+
+```{r cars}
+#if the Rapid Sequencing Kit was used i.e. SQK-NSK007, SQK-MAP006, run command with "ont-rapid" 
+#if ligation-based kits are used, run command with "ont-ligation"
+#if you are unsure, use porechop (below) that will show the kit while scanning entire data for any known adapters
+
+# Define directories
+input_dir="q11L500results"
+output_dir="longQC_output"
+
+# Path to LongQC directory
+longqc_dir="/home/ayesha/LongQC"
+
+# Create output directory if it doesn't exist
+mkdir -p "$output_dir"
+
+# Run LongQC with the correct preset
+python3 "$longqc_dir/longQC.py" sampleqc -x ont-ligation -o "$output_dir" "$input_dir"
+
+echo "LongQC analysis complete. Results saved in $output_dir."
+
+
+```
+
+##Install requirements
+
+```{r}
+conda create -n nanopore_env python=3.9 -y
+conda activate nanopore_env
+
+ # Install NanoFilt, NanoStat, NanoPlot (python-based tools)
+pip install NanoFilt NanoPlot NanoStat
+
+# Install Porechop
+pip install porechop 
+#if porechop doesnt install, use the following as alternative
+pip install cutadapt
+
+#Download and compile Minimap2:
+# Download Minimap2
+git clone https://github.com/lh3/minimap2.git
+cd minimap2
+make
+# Add minimap2 to PATH (optional)
+export PATH=$PATH:$(pwd)
+```
+
+##1. Quality Control (FastQC)
+assess the quality of the raw sequencing data (FASTQ files).
+It generates reports that highlight issues such as:
+Adapter contamination
+Low base quality
+GC content distribution
+Overrepresented sequences
+After running FastQC, you'll have a good overview of the quality of your data.
+```{r}
+#increase the space before running fastqc because it takes a lot of storage
+export _JAVA_OPTIONS="-Xmx2g"
+
+#go into the folder where fastq files are located, run the code:
+ fastqc *.fastq
+
+#if you have to run cfastqc for specific files, change the code snipet below in correspondence to name of fastq files
+fastqc barcode{53..74}_filtered_trimmed.fastq
+```
+
+##2. Filtering (Nanofilt)
+1. Perform quality checks on fastq files (e.g., length distribution, quality scores).
+2. Filter out low-quality reads using `NanoFilt` 
+```{r}
+#for it, enter the folder where your reads folder is located, The for loop iterates through all .fastq files in the reads_extracted folder.
+#!/bin/bash
+
+# Create results directory if it doesn't exist
+mkdir -p results
+
+# Loop through each FASTQ file in the reads_extracted folder
+for file in reads_extracted/*.fastq; do
+    # Extract the base name of the file (e.g., sample1 from sample1.fastq)
+    base=$(basename "$file" .fastq)
+
+    # Run NanoFilt for each file and save the output in the results directory
+    NanoFilt -q 9 -l 1000 "$file" > "results/${base}_filtered.fastq" #(recommended)
+    
+    NanoFilt -l 100 "$file" > "results/${base}_filtered.fastq"
+
+
+    echo "Processed $file -> results/${base}_filtered.fastq"
+done
+
+#the filtered fastq reads will be saved in "results" folder.
+```
+
+##3.Adapter Trimming and Barcode Removal (Porechop)
+focused on removing adapter sequences (such as barcodes and sequencing adapters), which should be done after filtering the reads to remove low-quality sequences.
+
+```{r pressure, echo=FALSE}
+#!/bin/bash
+
+# Define directory containing the filtered FASTQ files
+input_dir="/home/ayesha/v1v9nano/q11L500results"  # Change this if needed
+output_dir="/home/ayesha/v1v9nano/q11L500results_trimmed"  # Output directory for trimmed files
+
+# Create output directory if it doesn't exist
+mkdir -p "$output_dir"
+
+# Loop through all FASTQ files in the input directory
+for file in "$input_dir"/*.fastq; do
+    # Extract base name (remove directory and extension)
+    base=$(basename "$file" .fastq)
+    
+    # Run Porechop to trim adapters (Porechop auto-detects the adapters)
+    porechop -i "$file" -o "$output_dir/${base}_trimmed.fastq"
+    
+    # Print out status
+    echo "Trimmed $file -> $output_dir/${base}_trimmed.fastq"
+done
+
+echo "Porechop trimming completed!"
+
+```
+
+#Multiqc report
+
+```{r}
+#enter the folder where files are located
+ multiqc .
+```
+
+#4. Import data into QIIME2
+
+```{r}
+qiime tools import \
+  --type 'SampleData[SequencesWithQuality]' \
+  --input-path /home/ayesha/v1v9nano/manifest_fastqc_trimmed.tsv \
+  --input-format SingleEndFastqManifestPhred33V2 \
+  --output-path demux.qza
+
+
+ qiime demux summarize \
+  --i-data demux.qza \
+  --o-visualization demux.qzv
+
+#if manifest file is needed for importing:
+
+# Set the directory containing your FASTQ files
+FASTQ_DIR="/home/ayesha/v1v9nano/q11L500results_trimmed"
+
+# Create a new manifest file
+echo "sample-id,absolute-filepath,direction" > manifest_fastqc_trimmed.csv
+
+# Add each FASTQ file to the manifest file
+for file in $FASTQ_DIR/*_filtered_trimmed.fastq; do
+    # Get the sample ID from the filename (assuming barcode prefix)
+    sample_id=$(basename "$file" _filtered_trimmed.fastq)
+
+    # Add the file path to the manifest
+    echo "$sample_id,$file,forward" >> manifest_fastqc_trimmed.csv
+done
+
+#if needed, convert the .csv manifest into .tsv file
+ sed 's/,/\t/g' /home/ayesha/v1v9nano/manifest_fastqc_trimmed.csv > /home/ayesha/v1v9nano/manifest_fastqc_trimmed.tsv
+ 
+ 
+```
+#5. 
+We usually use DADA2 denoise but since our reads lengths are highly variable, we will use VSEARCH OTU Clustering
+```{r}
+qiime vsearch dereplicate-sequences \
+  --i-sequences demux.qza \
+  --o-dereplicated-table table.qza \
+  --o-dereplicated-sequences rep-seqs.qza
+
+qiime vsearch cluster-features-de-novo \
+  --i-sequences rep-seqs.qza \
+  --i-table table.qza \
+  --p-perc-identity 0.97 \ #sequences with ≥97% similarity will be grouped into the same OTU, a standard threshold for 16S rRNA analyses.
+  --o-clustered-table clustered_table.qza \
+  --o-clustered-sequences clustered_seqs.qza
+
+ #if the second step takes alot of time, use cpu cores by using thread command as follows:
+qiime vsearch cluster-features-de-novo \
+  --i-table table.qza \
+  --i-sequences rep-seqs.qza \
+  --p-perc-identity 0.97 \
+  --p-threads 10 \
+  --o-clustered-table clustered_table.qza \
+  --o-clustered-sequences clustered_seqs.qza
+#if you are using server, write --p-threads 6 
+```
+Train the classifier and visualize taxonomy results
+```{r}
+qiime feature-classifier classify-sklearn \
+  --i-classifier silva-138-full-length-classifier.qza \
+  --i-reads clustered_seqs.qza \
+  --o-classification taxonomy.qza
+
+qiime metadata tabulate \
+  --m-input-file taxonomy.qza \
+  --o-visualization taxonomy.qzv
+
+```
+
+Phylogenetic Tree
+```{r}
+qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences clustered_seqs.qza \
+  --o-alignment aligned-rep-seqs.qza \
+  --o-masked-alignment masked-aligned-rep-seqs.qza \
+  --o-tree unrooted-tree.qza \
+  --o-rooted-tree rooted-tree.qza
+
+```
+
